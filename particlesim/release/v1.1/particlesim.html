@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Particle Simulator</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; background-color: black; width: 100vw; height: 100vh; }
+        #console {
+    position: fixed; 
+    bottom: 0; 
+    left: 0; 
+    width: 100%; 
+    height: 200px; 
+    background-color: rgba(0, 0, 0, 0.8); 
+    color: white; 
+    font-family: monospace; 
+    padding: 10px; 
+    display: none;
+    flex-direction: column;
+}
+#console input {
+    background-color: #333; 
+    color: white; 
+    border: none; 
+    outline: none; 
+    font-family: monospace; 
+    font-size: 14px; 
+    width: 100%; 
+    padding: 5px; 
+    box-sizing: border-box;
+}
+#consoleLog {
+    background-color: #222;
+    color: white;
+    overflow-y: scroll;
+    flex-grow: 1;
+    padding: 5px;
+}
+#autocompleteSuggestions {
+    background-color: #333;
+    color: white;
+    display: none;
+    position: absolute;
+    bottom: 55px; /* Adjust this value based on the height of the input and other elements */
+    left: 0;
+    width: 100%;
+    max-height: 100px;
+    overflow-y: auto;
+}
+    </style>
+</head>
+<body>
+    <input type="file" id="modInput" webkitdirectory style="display: none;" />
+
+    <div id="title" style="position: fixed; top: 0; left: 0; width: 100%; text-align: center; font-size: small; color: white; background-color: rgba(0, 0, 0, 0.8);">Particle Simulator Release 1.1.0</div>
+
+    <canvas id="effectsCanvas"></canvas>
+    <div id="console">
+        <div id="consoleLog" style="height: 70%; overflow-y: scroll;"></div>
+        <input id="consoleInput" type="text" placeholder="Enter command here..." style="width: 100%; padding: 5px; box-sizing: border-box;">
+        <div id="autocompleteSuggestions" style="background-color: #333; color: white; display: none;"></div>
+    </div>       
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.7/dat.gui.min.js"></script>
+    <script>
+        const canvas = document.getElementById('effectsCanvas');
+        const gl = canvas.getContext('webgl2');
+
+        let mouseX = 0;
+        let mouseY = 0;
+        let showPreview = false;
+
+        function toggleConsole() {
+            const consoleElement = document.getElementById('console');
+            if (consoleElement.style.display === 'none' || consoleElement.style.display === '') {
+                consoleElement.style.display = 'block';
+            } else {
+                consoleElement.style.display = 'none';
+            }
+        }
+
+        window.addEventListener('keydown', (event) => {
+            if (event.key === 'F2') {
+                toggleConsole();
+            }
+        });
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gl.viewport(0, 0, canvas.width, canvas.height);
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas(); // Initial resize to set the correct canvas size
+
+        if (!gl) {
+            alert('WebGL 2 not supported by your browser');
+        }
+
+        // Vertex shader program
+        const vsSource = `
+            attribute vec4 aVertexPosition;
+            uniform float uPointSize;
+            void main(void) {
+                gl_Position = aVertexPosition;
+                gl_PointSize = uPointSize;
+            }
+        `;
+
+        // Fragment shader program
+        const fsSource = `
+            precision mediump float;
+            uniform vec4 uColor;
+            void main(void) {
+                float dist = distance(gl_PointCoord, vec2(0.5, 0.5));
+                if (dist < 0.5) {
+                    gl_FragColor = uColor;
+                } else {
+                    discard;
+                }
+            }
+        `;
+
+        // Initialize a shader program
+        function initShaderProgram(gl, vsSource, fsSource) {
+            const vertexShader = loadShader(gl, gl.VERTEX_SHADER, vsSource);
+            const fragmentShader = loadShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+            // Create the shader program
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertexShader);
+            gl.attachShader(shaderProgram, fragmentShader);
+            gl.linkProgram(shaderProgram);
+
+            // If creating the shader program failed, alert
+            if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+                alert('Unable to initialize the shader program: ' + gl.getProgramInfoLog(shaderProgram));
+                return null;
+            }
+
+            return shaderProgram;
+        }
+
+        // Creates a shader of the given type, uploads the source and compiles it.
+        function loadShader(gl, type, source) {
+            const shader = gl.createShader(type);
+
+            // Send the source to the shader object
+            gl.shaderSource(shader, source);
+
+            // Compile the shader program
+            gl.compileShader(shader);
+
+            // See if it compiled successfully
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                alert('An error occurred compiling the shaders: ' + gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+
+            return shader;
+        }
+
+        const shaderProgram = initShaderProgram(gl, vsSource, fsSource);
+
+        const programInfo = {
+            program: shaderProgram,
+            attribLocations: {
+                vertexPosition: gl.getAttribLocation(shaderProgram, 'aVertexPosition'),
+            },
+            uniformLocations: {
+                uColor: gl.getUniformLocation(shaderProgram, 'uColor'),
+                uPointSize: gl.getUniformLocation(shaderProgram, 'uPointSize'),
+            },
+        };
+
+        function initBuffers(gl) {
+            const positionBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            return {
+                position: positionBuffer,
+            };
+        }
+
+        const buffers = initBuffers(gl);
+
+        class Particle {
+    constructor(x, y, velocityX, velocityY, size, color) {
+        this.x = x;
+        this.y = y;
+        this.velocityX = velocityX;
+        this.velocityY = velocityY;
+        this.size = size;
+        this.color = color;
+        this.lifespan = particleSettings.lifespanEnabled ? particleSettings.lifespan : Infinity;
+        this.alive = true;
+    }
+
+    update() {
+        this.x += this.velocityX;
+        this.y += this.velocityY;
+
+        // Apply gravity effect with a reduced scale
+        this.velocityY -= particleSettings.gravity * 0.01; // Scale down the gravity effect
+
+        if (this.x < -1 || this.x > 1) {
+            this.velocityX *= -1;
+        }
+        if (this.y < -1 || this.y > 1) {
+            this.velocityY *= -1;
+        }
+
+        if (particleSettings.lifespanEnabled) {
+            this.lifespan -= 1;
+            if (this.lifespan <= 0) {
+                this.alive = false;
+            }
+        }
+    }
+
+    draw(gl, programInfo) {
+        const positions = [
+            this.x, this.y
+        ];
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffers.position);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+
+        gl.vertexAttribPointer(
+            programInfo.attribLocations.vertexPosition,
+            2,
+            gl.FLOAT,
+            false,
+            0,
+            0
+        );
+        gl.enableVertexAttribArray(programInfo.attribLocations.vertexPosition);
+
+        gl.useProgram(programInfo.program);
+
+        const [red, green, blue] = particleSettings.color;
+        gl.uniform4f(programInfo.uniformLocations.uColor, red / 255, green / 255, blue / 255, particleSettings.opacity);
+        gl.uniform1f(programInfo.uniformLocations.uPointSize, this.size);
+
+        gl.drawArrays(gl.POINTS, 0, 1);
+    }
+}
+
+        class ParticleSystem {
+            constructor() {
+                this.particles = [];
+            }
+
+            addParticle(particle) {
+                this.particles.push(particle);
+            }
+
+            update() {
+                this.particles = this.particles.filter(particle => particle.alive);
+                this.particles.forEach(particle => particle.update());
+            }
+
+            draw(gl, programInfo) {
+                this.particles.forEach(particle => particle.draw(gl, programInfo));
+            }
+        }
+
+        const particleSystem = new ParticleSystem();
+
+        function createParticles(x, y, size, speed, color) {
+            for (let i = 0; i < 10; i++) {
+                const velocityX = (Math.random() * 2 - 1) * speed;
+                const velocityY = (Math.random() * 2 - 1) * speed;
+                const particle = new Particle(x, y, velocityX, velocityY, size, color);
+                particleSystem.addParticle(particle);
+            }
+        }
+
+        function drawScene(gl, programInfo) {
+            gl.clearColor(0.0, 0.0, 0.0, 1.0);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            particleSystem.draw(gl, programInfo);
+            if (showPreview) {
+                const color = [particleSettings.red / 255, particleSettings.green / 255, particleSettings.blue / 255, 0.5];
+                const previewParticle = new Particle(mouseX, mouseY, 0, 0, particleSettings.size, color);
+                previewParticle.draw(gl, programInfo);
+            }
+        }
+
+        function loop() {
+            requestAnimationFrame(loop);
+            particleSystem.update();
+            drawScene(gl, programInfo);
+        }
+
+        loop();
+
+        canvas.addEventListener('mousemove', (event) => {
+            const rect = canvas.getBoundingClientRect();
+            mouseX = ((event.clientX - rect.left) / canvas.width) * 2 - 1;
+            mouseY = ((event.clientY - rect.top) / canvas.height) * -2 + 1;
+            showPreview = true;
+        });
+
+        canvas.addEventListener('mouseout', () => {
+            showPreview = false;
+        });
+
+        canvas.addEventListener('click', (event) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = ((event.clientX - rect.left) / canvas.width) * 2 - 1;
+            const y = ((event.clientY - rect.top) / canvas.height) * -2 + 1;
+            createParticles(x, y, particleSettings.size, particleSettings.speed * 0.01, [particleSettings.red / 255, particleSettings.green / 255, particleSettings.blue / 255]);
+        });
+
+        const gui = new dat.GUI();
+const particleSettings = {
+    size: 5,
+    speed: 1,
+    color: [255, 0, 0], // Initial particle color
+    gravity: 0,
+    lifespanEnabled: false, // Toggle for lifespan
+    lifespan: 100,
+    opacity: 1,
+    clearCanvas: function() {
+        particleSystem.particles = [];
+    },
+    loadMods: function() {
+        document.getElementById('modInput').click();
+    }
+};
+
+const appearanceFolder = gui.addFolder('Appearance Settings');
+appearanceFolder.add(particleSettings, 'size', 1, 20).name('Particle Size');
+appearanceFolder.add(particleSettings, 'opacity', 0, 1).name('Opacity');
+appearanceFolder.addColor(particleSettings, 'color').name('Particle Color');
+
+const physicsFolder = gui.addFolder('Physics Settings');
+physicsFolder.add(particleSettings, 'speed', 0, 5).name('Particle Speed');
+physicsFolder.add(particleSettings, 'gravity', 0, 0.1).name('Gravity');
+physicsFolder.add(particleSettings, 'lifespanEnabled').name('Enable Lifespan').onChange((value) => {
+    if (value) {
+        lifespanController.domElement.style.display = '';
+    } else {
+        lifespanController.domElement.style.display = 'none';
+    }
+});
+const lifespanController = physicsFolder.add(particleSettings, 'lifespan', 1, 500).name('Lifespan');
+lifespanController.domElement.style.display = 'none';
+
+const controlFolder = gui.addFolder('Control Settings');
+controlFolder.add(particleSettings, 'clearCanvas').name('Clear Canvas');
+
+// Adding a button to disable all mods, it refreshes the page :|
+// Define the unloadMods function
+const unloadMods = {
+    UnloadMods: function() {
+        alert("Are you sure you want to disable all mods? (This refreshes the code.)");
+        location.reload();
+    }
+};
+
+
+// Container for mods
+const mods = {};
+
+// Function to update the mod list in the GUI
+function updateModGUI() {
+    if (gui.__folders["Loaded Mods"]) {
+        gui.removeFolder(gui.__folders["Loaded Mods"]);
+    }
+
+    const modsFolder = gui.addFolder("Loaded Mods");
+
+    Object.keys(mods).forEach(name => {
+        const folder = modsFolder.addFolder(name);
+        folder.add(mods[name], 'enabled').name('Enabled').onChange(value => {
+            mods[name].scriptElement.disabled = !value;
+            logToConsole(`${value ? 'Enabled' : 'Disabled'} mod: ${name}`);
+        });
+        folder.add(modLoader, 'removeMod', name).name('Remove');
+    });
+}
+
+const modLoader = {
+    addMod: function() {
+        document.getElementById('modInput').click();
+    },
+    removeMod: function(name) {
+        if (mods[name]) {
+            document.body.removeChild(mods[name].scriptElement);
+            delete mods[name];
+            updateModGUI();
+            logToConsole(`Removed mod: ${name}`);
+        } else {
+            logToConsole(`Mod not found: ${name}`);
+        }
+    }
+};
+
+const modLoaderGUI = gui.addFolder("Mod Loader");
+modLoaderGUI.add(modLoader, 'addMod').name('Add Mod');
+modLoaderGUI.add(unloadMods, 'UnloadMods').name('Unload All Mods');
+
+// Handle the file input change event
+document.getElementById('modInput').addEventListener('change', async function(event) {
+    const files = event.target.files;
+    let modJSFile = null;
+    let modInfoFile = null;
+
+    for (let i = 0; i < files.length; i++) {
+        if (files[i].name === 'mod.js') {
+            modJSFile = files[i];
+        } else if (files[i].name === 'modinfo.json') {
+            modInfoFile = files[i];
+        }
+    }
+
+    if (modJSFile && modInfoFile) {
+        const modInfo = await loadJSON(modInfoFile);
+        const modScript = await loadScript(modJSFile);
+
+        mods[modInfo.name] = {
+            info: modInfo,
+            scriptElement: modScript,
+            enabled: true
+        };
+
+        document.body.appendChild(modScript);
+        updateModGUI();
+        logToConsole(`Loaded mod: ${modInfo.name} by ${modInfo.author}`);
+    } else {
+        logToConsole('Invalid mod folder. Ensure it contains mod.js and modinfo.json.');
+    }
+});
+
+async function loadJSON(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            try {
+                const json = JSON.parse(e.target.result);
+                resolve(json);
+            } catch (error) {
+                reject(error);
+            }
+        };
+        reader.onerror = function() {
+            reject(reader.error);
+        };
+        reader.readAsText(file);
+    });
+}
+
+async function loadScript(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const script = document.createElement('script');
+            script.textContent = e.target.result;
+            resolve(script);
+        };
+        reader.onerror = function() {
+            reject(reader.error);
+        };
+        reader.readAsText(file);
+    });
+}
+
+function logToConsole(message) {
+    const logEntry = document.createElement('div');
+    logEntry.textContent = message;
+    const consoleLog = document.getElementById('consoleLog');
+    consoleLog.appendChild(logEntry);
+    consoleLog.scrollTop = consoleLog.scrollHeight;
+}
+
+const availableCommands = [
+    'clear', 'size', 'speed', 'gravity', 'color', 'pause', 'resume', 'reset',
+    'background', 'help', 'version', 'save', 'load', 'export', 'import', 'randomize',
+    'stop', 'start', 'fullscreen', 'exit', 'show', 'hide', 'increase', 'decrease',
+    'easteregg'
+];
+
+function logToConsole(message) {
+    const logEntry = document.createElement('div');
+    logEntry.textContent = message;
+    const consoleLog = document.getElementById('consoleLog');
+    consoleLog.appendChild(logEntry);
+    consoleLog.scrollTop = consoleLog.scrollHeight;
+}
+
+document.getElementById('consoleInput').addEventListener('input', function(event) {
+    const input = event.target.value;
+    updateAutocompleteSuggestions(input);
+});
+
+document.getElementById('consoleInput').addEventListener('keydown', function(event) {
+    if (event.key === 'Enter') {
+        const command = event.target.value;
+        logToConsole('> ' + command);
+        executeCommand(command);
+        event.target.value = '';
+        document.getElementById('autocompleteSuggestions').style.display = 'none';
+    }
+});
+
+function updateAutocompleteSuggestions(input) {
+    const suggestions = availableCommands.filter(cmd => cmd.includes(input));
+    const suggestionBox = document.getElementById('autocompleteSuggestions');
+    suggestionBox.innerHTML = '';
+    if (suggestions.length > 0 && input.length > 0) {
+        suggestions.forEach(suggestion => {
+            const div = document.createElement('div');
+            div.textContent = suggestion;
+            div.style.padding = '5px';
+            div.style.cursor = 'pointer';
+            div.addEventListener('click', () => {
+                document.getElementById('consoleInput').value = suggestion;
+                suggestionBox.style.display = 'none';
+            });
+            suggestionBox.appendChild(div);
+        });
+        suggestionBox.style.display = 'block';
+    } else {
+        suggestionBox.style.display = 'none';
+    }
+}
+
+function executeCommand(command) {
+    const parts = command.split(' ');
+    const cmd = parts[0];
+    const args = parts.slice(1);
+
+    switch (cmd.toLowerCase()) {
+        case 'clear':
+            particleSettings.clearCanvas();
+            logToConsole('Canvas cleared.');
+            break;
+        case 'size':
+            if (args.length > 0 && !isNaN(args[0])) {
+                particleSettings.size = parseFloat(args[0]);
+                logToConsole(`Particle size set to ${particleSettings.size}.`);
+            } else {
+                logToConsole('Invalid size value.');
+            }
+            break;
+        case 'speed':
+            if (args.length > 0 && !isNaN(args[0])) {
+                particleSettings.speed = parseFloat(args[0]);
+                logToConsole(`Particle speed set to ${particleSettings.speed}.`);
+            } else {
+                logToConsole('Invalid speed value.');
+            }
+            break;
+        case 'gravity':
+            if (args.length > 0 && !isNaN(args[0])) {
+                particleSettings.gravity = parseFloat(args[0]);
+                logToConsole(`Gravity set to ${particleSettings.gravity}.`);
+            } else {
+                logToConsole('Invalid gravity value.');
+            }
+            break;
+        case 'color':
+            if (args.length === 3 && !isNaN(args[0]) && !isNaN(args[1]) && !isNaN(args[2])) {
+                particleSettings.color = [parseInt(args[0]), parseInt(args[1]), parseInt(args[2])];
+                logToConsole(`Color set to RGB(${particleSettings.color[0]}, ${particleSettings.color[1]}, ${particleSettings.color[2]}).`);
+            } else {
+                logToConsole('Invalid color values.');
+            }
+            break;
+        case 'pause':
+            // Implement pause logic
+            logToConsole('Simulation paused.');
+            break;
+        case 'resume':
+            // Implement resume logic
+            logToConsole('Simulation resumed.');
+            break;
+        case 'reset':
+            // Implement reset logic
+            logToConsole('Simulation reset.');
+            break;
+        case 'background':
+            // Implement background color change logic
+            logToConsole('Background color changed.');
+            break;
+        case 'help':
+            logToConsole('Available commands: ' + availableCommands.join(', '));
+            break;
+        case 'version':
+            logToConsole('Simulation version 1.1.*');
+            break;
+        case 'save':
+            // Implement save logic
+            logToConsole('Simulation saved.');
+            break;
+        case 'load':
+            // Implement load logic
+            logToConsole('Simulation loaded.');
+            break;
+        case 'export':
+            // Implement export logic
+            logToConsole('Simulation exported.');
+            break;
+        case 'import':
+            // Implement import logic
+            logToConsole('Simulation imported.');
+            break;
+        case 'randomize':
+            // Implement randomize logic
+            logToConsole('Particles randomized.');
+            break;
+        case 'stop':
+            // Implement stop logic
+            logToConsole('Simulation stopped.');
+            break;
+        case 'start':
+            // Implement start logic
+            logToConsole('Simulation started.');
+            break;
+        case 'fullscreen':
+            // Implement fullscreen logic
+            logToConsole('Entered fullscreen mode.');
+            break;
+        case 'exit':
+            // Implement exit fullscreen logic
+            logToConsole('Exited fullscreen mode.');
+            break;
+        case 'show':
+            // Implement show UI logic
+            logToConsole('UI shown.');
+            break;
+        case 'hide':
+            // Implement hide UI logic
+            logToConsole('UI hidden.');
+            break;
+        case 'increase':
+            if (args.length > 0 && !isNaN(args[0])) {
+                particleSettings.size += parseFloat(args[0]);
+                logToConsole(`Particle size increased by ${args[0]}.`);
+            } else {
+                logToConsole('Invalid increase value.');
+            }
+            break;
+        case 'decrease':
+            if (args.length > 0 && !isNaN(args[0])) {
+                particleSettings.size -= parseFloat(args[0]);
+                logToConsole(`Particle size decreased by ${args[0]}.`);
+            } else {
+                logToConsole('Invalid decrease value.');
+            }
+            break;
+        case 'easteregg':
+            logToConsole('You found the easter egg!');
+            break;
+        default:
+            logToConsole('Unknown command.');
+    }
+}
+
+
+    </script>
+</body>
+</html>
